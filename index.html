@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!-- ... existing code ... -->
+  <!-- Tone.js for subtle synthesized game audio -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+
+  <!-- PeerJS for zero-setup global 1v1 WebRTC multiplayer -->
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+
+  <style>
+<!-- ... existing code ... -->
+        <p id="mp-status-note" class="text-[11px] text-center text-emerald-400">
+          Ready for global 1v1 Friend Code battles!
+        </p>
+      </div>
+<!-- ... existing code ... -->
+  <!-- APPLICATION LOGIC                                                     -->
+  <!-- ===================================================================== -->
+  <script>
+    // =========================================================================
+    // 1. GAME CONSTANTS & COUNTRY DATASET (132 Countries)
+    //    radiusKm gives large countries a fair "direct hit" zone around centroid
+    // =========================================================================
+<!-- ... existing code ... -->
+    const state = {
+      mode: 'lobby',          // 'lobby' | 'solo' | 'mp'
+      phase: 'idle',          // 'idle' | 'waiting' | 'playing' | 'reveal' | 'finished'
+      muted: false,
+      audioReady: false,
+      mapStyle: 'realistic',  // 'realistic' | 'atlas' | 'satellite'
+      playerName: 'Explorer',
+      peerReady: false,
+
+      // Pending local map selection
+      pendingPin: null,
+      pendingMarker: null,
+
+      // Active reveal map layers
+      revealLayers: [],
+
+      // Active round countdown interval
+      timerInterval: null,
+
+      // Solo session state
+      solo: {
+        deck: [],
+        roundIndex: 0,
+        hearts: MAX_HEARTS,
+        streak: 0,
+        bestStreak: 0,
+        totalDistance: 0,
+        roundsPlayed: 0,
+        roundEndMs: 0,
+        locked: false
+      },
+
+      // Multiplayer session state (PeerJS WebRTC)
+      mp: {
+        roomCode: null,
+        role: null,           // 'host' | 'guest'
+        peer: null,
+        conn: null,
+        lastPhaseKey: null,
+        resolvingRound: false,
+        roomData: null
+      }
+    };
+<!-- ... existing code ... -->
+    // =========================================================================
+    // 10. PEERJS (WEBRTC) ZERO-SETUP 1v1 MULTIPLAYER
+    // =========================================================================
+    const PEER_PREFIX = 'ftc-1v1-room-';
+    const PEER_CONFIG = {
+      debug: 0,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' }
+        ]
+      }
+    };
+
+    function initMultiplayer() {
+      if (typeof Peer === 'undefined') {
+        el.mpStatusNote.textContent = 'Multiplayer library failed to load — Solo Practice is ready!';
+        el.mpStatusNote.className = 'text-[11px] text-center text-amber-400';
+        el.btnCreateRoom.disabled = true;
+        el.btnJoinRoom.disabled = true;
+        return;
+      }
+      state.peerReady = true;
+      el.mpStatusNote.textContent = 'Online & ready for global 1v1 Friend Code battles.';
+      el.mpStatusNote.className = 'text-[11px] text-center text-emerald-400';
+    }
+
+    function cleanupPeer() {
+      if (state.mp.conn) {
+        try { state.mp.conn.close(); } catch {}
+        state.mp.conn = null;
+      }
+      if (state.mp.peer) {
+        try { state.mp.peer.destroy(); } catch {}
+        state.mp.peer = null;
+      }
+    }
+
+    function broadcastRoomState() {
+      if (state.mp.role === 'host' && state.mp.conn && state.mp.conn.open && state.mp.roomData) {
+        try {
+          state.mp.conn.send({ type: 'state', data: state.mp.roomData });
+        } catch (err) {
+          console.error('Broadcast error:', err);
+        }
+      }
+    }
+
+    function createMultiplayerRoom() {
+      if (!state.peerReady) {
+        showToast('Multiplayer is unavailable right now.', 'error');
+        return;
+      }
+
+      cleanupPeer();
+      state.playerName = getSanitizedName();
+      el.btnCreateRoom.disabled = true;
+      el.mpStatusNote.textContent = 'Creating 1v1 room...';
+
+      const roomCode = generateRoomCode();
+      const peer = new Peer(PEER_PREFIX + roomCode, PEER_CONFIG);
+      state.mp.peer = peer;
+
+      peer.on('open', () => {
+        el.btnCreateRoom.disabled = false;
+        el.mpStatusNote.textContent = 'Online & ready for global 1v1 Friend Code battles.';
+
+        state.mode = 'mp';
+        state.mp.roomCode = roomCode;
+        state.mp.role = 'host';
+        state.mp.lastPhaseKey = null;
+        state.mp.resolvingRound = false;
+        state.mp.roomData = {
+          code: roomCode,
+          status: 'waiting',
+          hostName: state.playerName,
+          guestConnected: false,
+          guestName: null,
+          hostHearts: MAX_HEARTS,
+          guestHearts: MAX_HEARTS,
+          deck: buildShuffledDeck(45),
+          roundIndex: 0,
+          roundEndTime: 0,
+          hostGuess: null,
+          guestGuess: null,
+          lastRoundResult: null,
+          winnerRole: null
+        };
+
+        el.lobbyOverlay.classList.add('hidden');
+        el.summaryOverlay.classList.add('hidden');
+        el.waitingRoomCode.textContent = roomCode;
+        handleRoomUpdate(state.mp.roomData);
+      });
+
+      peer.on('connection', (conn) => {
+        // Reject extra connections if a challenger is already in the room
+        if (state.mp.conn && state.mp.conn.open) {
+          conn.on('open', () => {
+            conn.send({ type: 'full' });
+            setTimeout(() => conn.close(), 150);
+          });
+          return;
+        }
+
+        state.mp.conn = conn;
+
+        conn.on('data', (msg) => {
+          if (!msg || !state.mp.roomData) return;
+
+          if (msg.type === 'join') {
+            state.mp.roomData.guestConnected = true;
+            state.mp.roomData.guestName = String(msg.name || 'Challenger').slice(0, 16);
+            showToast(`${state.mp.roomData.guestName} joined the room!`, 'success');
+            broadcastRoomState();
+            handleRoomUpdate(state.mp.roomData);
+          } else if (msg.type === 'guess' && state.mp.roomData.status === 'playing') {
+            if (!state.mp.roomData.guestGuess?.locked && msg.pin) {
+              state.mp.roomData.guestGuess = {
+                lat: msg.pin.lat,
+                lng: msg.pin.lng,
+                locked: true,
+                lockedAt: Date.now()
+              };
+              broadcastRoomState();
+              handleRoomUpdate(state.mp.roomData);
+            }
+          }
+        });
+
+        conn.on('close', () => {
+          state.mp.conn = null;
+          if (!state.mp.roomData) return;
+          if (state.mp.roomData.status === 'waiting') {
+            state.mp.roomData.guestConnected = false;
+            state.mp.roomData.guestName = null;
+            showToast('Challenger left the waiting room.', 'info');
+            handleRoomUpdate(state.mp.roomData);
+          } else if (state.mode === 'mp') {
+            showToast('Opponent disconnected.', 'error');
+            returnToLobby();
+          }
+        });
+      });
+
+      peer.on('error', (err) => {
+        console.error('PeerJS host error:', err);
+        el.btnCreateRoom.disabled = false;
+        el.mpStatusNote.textContent = 'Online & ready for global 1v1 Friend Code battles.';
+        showToast('Could not create room. Please try again.', 'error');
+        if (state.mode === 'mp') returnToLobby();
+      });
+    }
+
+    function joinMultiplayerRoom() {
+      if (!state.peerReady) {
+        showToast('Multiplayer is unavailable right now.', 'error');
+        return;
+      }
+
+      const code = (el.inputRoomCode.value || '').trim().toUpperCase();
+      if (code.length < 4) {
+        showToast('Enter a valid 6-character Friend Code.', 'error');
+        return;
+      }
+
+      cleanupPeer();
+      state.playerName = getSanitizedName();
+      el.btnJoinRoom.disabled = true;
+      el.mpStatusNote.textContent = `Connecting to room ${code}...`;
+
+      const peer = new Peer(PEER_CONFIG);
+      state.mp.peer = peer;
+      let joined = false;
+
+      const connectTimeout = setTimeout(() => {
+        if (!joined) {
+          el.btnJoinRoom.disabled = false;
+          el.mpStatusNote.textContent = 'Online & ready for global 1v1 Friend Code battles.';
+          showToast(`Could not find room "${code}". Check the code and try again.`, 'error');
+          cleanupPeer();
+        }
+      }, 9000);
+
+      peer.on('open', () => {
+        const conn = peer.connect(PEER_PREFIX + code, { reliable: true });
+        state.mp.conn = conn;
+
+        conn.on('open', () => {
+          joined = true;
+          clearTimeout(connectTimeout);
+          el.btnJoinRoom.disabled = false;
+          el.mpStatusNote.textContent = 'Online & ready for global 1v1 Friend Code battles.';
+
+          state.mode = 'mp';
+          state.mp.roomCode = code;
+          state.mp.role = 'guest';
+          state.mp.lastPhaseKey = null;
+          state.mp.resolvingRound = false;
+
+          el.lobbyOverlay.classList.add('hidden');
+          el.summaryOverlay.classList.add('hidden');
+          el.waitingRoomCode.textContent = code;
+
+          conn.send({ type: 'join', name: state.playerName });
+        });
+
+        conn.on('data', (msg) => {
+          if (!msg) return;
+          if (msg.type === 'full') {
+            showToast('This 1v1 room is already full!', 'error');
+            returnToLobby();
+            return;
+          }
+          if (msg.type === 'state' && msg.data) {
+            handleRoomUpdate(msg.data);
+          }
+        });
+
+        conn.on('close', () => {
+          if (state.mode === 'mp') {
+            showToast('Host closed the room.', 'info');
+            returnToLobby();
+          }
+        });
+      });
+
+      peer.on('error', (err) => {
+        console.error('PeerJS guest error:', err);
+        clearTimeout(connectTimeout);
+        el.btnJoinRoom.disabled = false;
+        el.mpStatusNote.textContent = 'Online & ready for global 1v1 Friend Code battles.';
+        if (err.type === 'peer-unavailable') {
+          showToast(`Room "${code}" not found.`, 'error');
+        } else {
+          showToast('Connection failed. Please try again.', 'error');
+        }
+        cleanupPeer();
+      });
+    }
+
+    function handleRoomUpdate(data) {
+      state.mp.roomData = data;
+      const isHost = state.mp.role === 'host';
+
+      // 1. WAITING ROOM PHASE
+      if (data.status === 'waiting') {
+        stopTimer();
+        clearMapOverlays();
+        state.phase = 'waiting';
+
+        el.waitingOverlay.classList.remove('hidden');
+        el.hudOverlay.classList.add('hidden');
+        el.bottomBar.classList.add('hidden');
+        el.summaryOverlay.classList.add('hidden');
+
+        el.waitingHostName.textContent = data.hostName || 'Host';
+        if (data.guestConnected) {
+          el.waitingGuestName.textContent = data.guestName || 'Challenger';
+          el.waitingGuestName.classList.replace('text-slate-400', 'text-white');
+        } else {
+          el.waitingGuestName.textContent = 'Waiting...';
+          el.waitingGuestName.classList.replace('text-white', 'text-slate-400');
+        }
+
+        if (isHost) {
+          el.btnStartMatch.classList.remove('hidden');
+          el.btnStartMatch.disabled = !data.guestConnected;
+          el.waitingGuestMsg.classList.add('hidden');
+        } else {
+          el.btnStartMatch.classList.add('hidden');
+          el.waitingGuestMsg.classList.remove('hidden');
+        }
+        return;
+      }
+
+      // Common HUD updates for playing / reveal / finished
+      el.waitingOverlay.classList.add('hidden');
+      el.hudOverlay.classList.remove('hidden');
+      el.bottomBar.classList.remove('hidden');
+      el.hudModeBadge.textContent = `Room ${data.code}`;
+      el.hudP2Container.classList.remove('hidden');
+      el.hudSoloContainer.classList.add('hidden');
+
+      const myName = isHost ? data.hostName : data.guestName;
+      const oppName = isHost ? data.guestName : data.hostName;
+      const myHearts = isHost ? data.hostHearts : data.guestHearts;
+      const oppHearts = isHost ? data.guestHearts : data.hostHearts;
+      const myGuess = isHost ? data.hostGuess : data.guestGuess;
+      const oppGuess = isHost ? data.guestGuess : data.hostGuess;
+
+      el.hudP1Name.textContent = myName || 'You';
+      el.hudP2Name.textContent = oppName || 'Opponent';
+      renderHearts(el.hudP1Hearts, myHearts);
+      renderHearts(el.hudP2Hearts, oppHearts);
+      renderHearts(el.mobileHearts, myHearts);
+
+      const country = COUNTRIES[data.deck[data.roundIndex % data.deck.length]];
+      el.hudRoundLabel.textContent = `Round ${data.roundIndex + 1}`;
+      const flagMarkup = getFlagHtml(country, 'lg');
+      el.hudCountryFlag.innerHTML = flagMarkup;
+      el.hudCountryName.textContent = country.name;
+      el.mobileCountryFlag.innerHTML = flagMarkup;
+      el.mobileCountryName.textContent = country.name;
+
+      // 2. PLAYING PHASE
+      if (data.status === 'playing') {
+        el.summaryOverlay.classList.add('hidden');
+        el.controlsPlaying.classList.remove('hidden');
+        el.controlsReveal.classList.add('hidden');
+
+        // Locked status badges
+        el.hudP1Status.classList.toggle('hidden', !(myGuess && myGuess.locked));
+        el.hudP2Status.classList.toggle('hidden', !(oppGuess && oppGuess.locked));
+
+        const phaseKey = `playing-${data.roundIndex}-${data.roundEndTime}`;
+        if (state.mp.lastPhaseKey !== phaseKey) {
+          state.mp.lastPhaseKey = phaseKey;
+          state.mp.resolvingRound = false;
+          state.phase = 'playing';
+          clearMapOverlays();
+          resetMapView();
+          el.btnLockGuess.disabled = true;
+          el.playingHint.textContent = 'Click anywhere on the map to drop your pin.';
+
+          // Use local duration for guest to avoid clock skew between countries
+          const endMs = isHost ? data.roundEndTime : (Date.now() + ROUND_DURATION_SEC * 1000);
+          startCountdown(endMs, () => {
+            if (isHost) {
+              hostResolveMultiplayerRound(state.mp.roomData);
+            }
+          });
+        }
+
+        if (myGuess && myGuess.locked) {
+          el.btnLockGuess.disabled = true;
+          el.playingHint.textContent = oppGuess && oppGuess.locked
+            ? 'Both players locked in! Calculating...'
+            : `Locked in! Waiting for ${oppName || 'opponent'}...`;
+        }
+
+        // If both players locked in early, host immediately resolves the round
+        if (isHost && data.hostGuess?.locked && data.guestGuess?.locked && !state.mp.resolvingRound) {
+          hostResolveMultiplayerRound(data);
+        }
+        return;
+      }
+
+      // 3. REVEAL PHASE
+      if (data.status === 'reveal') {
+        stopTimer();
+        state.phase = 'reveal';
+        el.summaryOverlay.classList.add('hidden');
+        el.controlsPlaying.classList.add('hidden');
+        el.controlsReveal.classList.remove('hidden');
+        el.hudP1Status.classList.add('hidden');
+        el.hudP2Status.classList.add('hidden');
+
+        const phaseKey = `reveal-${data.roundIndex}`;
+        if (state.mp.lastPhaseKey !== phaseKey) {
+          state.mp.lastPhaseKey = phaseKey;
+          const res = data.lastRoundResult;
+
+          const p1Pin = isHost ? data.hostGuess : data.guestGuess;
+          const p2Pin = isHost ? data.guestGuess : data.hostGuess;
+          const p1Dist = isHost ? res.hostDist : res.guestDist;
+          const p2Dist = isHost ? res.guestDist : res.hostDist;
+
+          showRevealOnMap(
+            country,
+            { name: myName, pin: p1Pin ? { lat: p1Pin.lat, lng: p1Pin.lng } : null, dist: p1Dist },
+            { name: oppName, pin: p2Pin ? { lat: p2Pin.lat, lng: p2Pin.lng } : null, dist: p2Dist }
+          );
+
+          const myRole = state.mp.role;
+          if (res.roundWinner === myRole) {
+            el.revealHeadline.innerHTML = `<span class="text-emerald-400">You won the round!</span> ${escapeHtml(oppName)} lost 1 ❤️`;
+            playSfx('win');
+          } else if (res.roundWinner === 'tie') {
+            el.revealHeadline.innerHTML = `<span class="text-sky-400">Round Tie!</span> No hearts lost.`;
+            playSfx('pin');
+          } else {
+            el.revealHeadline.innerHTML = `<span class="text-rose-400">${escapeHtml(oppName)} was closer!</span> You lost 1 ❤️`;
+            playSfx('lose');
+          }
+
+          el.revealDetails.innerHTML = `
+            <div><span class="text-sky-300 font-bold">${escapeHtml(myName)}:</span> ${formatKm(p1Dist)}</div>
+            <div><span class="text-amber-300 font-bold">${escapeHtml(oppName)}:</span> ${formatKm(p2Dist)}</div>
+          `;
+        }
+
+        if (isHost) {
+          el.btnNextRound.classList.remove('hidden');
+          el.btnNextRound.textContent = 'Next Round →';
+          el.waitingHostNext.classList.add('hidden');
+        } else {
+          el.btnNextRound.classList.add('hidden');
+          el.waitingHostNext.classList.remove('hidden');
+        }
+        return;
+      }
+
+      // 4. FINISHED PHASE
+      if (data.status === 'finished') {
+        stopTimer();
+        state.phase = 'finished';
+        el.controlsPlaying.classList.add('hidden');
+        el.controlsReveal.classList.add('hidden');
+
+        const phaseKey = `finished-${data.roundIndex}-${data.winnerRole}`;
+        if (state.mp.lastPhaseKey !== phaseKey) {
+          state.mp.lastPhaseKey = phaseKey;
+          const res = data.lastRoundResult;
+          if (res) {
+            const p1Pin = isHost ? data.hostGuess : data.guestGuess;
+            const p2Pin = isHost ? data.guestGuess : data.hostGuess;
+            const p1Dist = isHost ? res.hostDist : res.guestDist;
+            const p2Dist = isHost ? res.guestDist : res.hostDist;
+            showRevealOnMap(
+              country,
+              { name: myName, pin: p1Pin ? { lat: p1Pin.lat, lng: p1Pin.lng } : null, dist: p1Dist },
+              { name: oppName, pin: p2Pin ? { lat: p2Pin.lat, lng: p2Pin.lng } : null, dist: p2Dist }
+            );
+          }
+
+          const iWon = data.winnerRole === state.mp.role;
+          if (data.winnerRole === 'tie') {
+            el.summaryEmoji.textContent = '🤝';
+            el.summaryTitle.textContent = 'Draw Match!';
+            el.summarySubtitle.textContent = 'Both players ran out of hearts at the exact same time.';
+          } else if (iWon) {
+            el.summaryEmoji.textContent = '🏆';
+            el.summaryTitle.textContent = 'Victory!';
+            el.summarySubtitle.textContent = `You defeated ${oppName} in ${data.roundIndex + 1} rounds!`;
+            playSfx('win');
+          } else {
+            el.summaryEmoji.textContent = '💔';
+            el.summaryTitle.textContent = 'Defeat';
+            el.summarySubtitle.textContent = `${oppName} won the battle in ${data.roundIndex + 1} rounds.`;
+            playSfx('lose');
+          }
+
+          el.summaryStats.innerHTML = `
+            <div class="flex justify-between"><span class="text-sky-300 font-bold">${escapeHtml(myName)}</span><span>${myHearts} ❤️ remaining</span></div>
+            <div class="flex justify-between"><span class="text-amber-300 font-bold">${escapeHtml(oppName)}</span><span>${oppHearts} ❤️ remaining</span></div>
+            <div class="flex justify-between pt-1 border-t border-slate-700/70"><span class="text-slate-400">Rounds Played</span><span class="font-bold text-white">${data.roundIndex + 1}</span></div>
+          `;
+
+          if (isHost) {
+            el.btnRematch.classList.remove('hidden');
+            el.btnRematch.textContent = 'Rematch';
+          } else {
+            el.btnRematch.classList.add('hidden');
+          }
+
+          el.summaryOverlay.classList.remove('hidden');
+        }
+      }
+    }
+
+    function hostStartMatch() {
+      if (state.mp.role !== 'host' || !state.mp.roomData || !state.mp.roomData.guestConnected) return;
+      state.mp.roomData = {
+        ...state.mp.roomData,
+        status: 'playing',
+        hostHearts: MAX_HEARTS,
+        guestHearts: MAX_HEARTS,
+        deck: buildShuffledDeck(45),
+        roundIndex: 0,
+        roundEndTime: Date.now() + ROUND_DURATION_SEC * 1000,
+        hostGuess: null,
+        guestGuess: null,
+        lastRoundResult: null,
+        winnerRole: null
+      };
+      broadcastRoomState();
+      handleRoomUpdate(state.mp.roomData);
+    }
+
+    function lockInMultiplayerGuess() {
+      if (!state.pendingPin || !state.mp.roomData) return;
+      el.btnLockGuess.disabled = true;
+      playSfx('lock');
+
+      const guessObj = {
+        lat: state.pendingPin.lat,
+        lng: state.pendingPin.lng,
+        locked: true,
+        lockedAt: Date.now()
+      };
+
+      if (state.mp.role === 'host') {
+        state.mp.roomData.hostGuess = guessObj;
+        broadcastRoomState();
+        handleRoomUpdate(state.mp.roomData);
+      } else if (state.mp.conn && state.mp.conn.open) {
+        state.mp.roomData.guestGuess = guessObj;
+        state.mp.conn.send({ type: 'guess', pin: state.pendingPin });
+        handleRoomUpdate(state.mp.roomData);
+      }
+    }
+
+    function hostResolveMultiplayerRound(data) {
+      if (!data || data.status !== 'playing' || state.mp.resolvingRound) return;
+      state.mp.resolvingRound = true;
+
+      const country = COUNTRIES[data.deck[data.roundIndex % data.deck.length]];
+      const hostDist = calcEffectiveDistance(data.hostGuess, country);
+      const guestDist = calcEffectiveDistance(data.guestGuess, country);
+
+      let hostHearts = data.hostHearts;
+      let guestHearts = data.guestHearts;
+      let roundWinner = 'tie';
+
+      if (hostDist === null && guestDist === null) {
+        roundWinner = 'tie';
+      } else if (hostDist === null) {
+        roundWinner = 'guest';
+        hostHearts = Math.max(0, hostHearts - 1);
+      } else if (guestDist === null) {
+        roundWinner = 'host';
+        guestHearts = Math.max(0, guestHearts - 1);
+      } else if (hostDist < guestDist) {
+        roundWinner = 'host';
+        guestHearts = Math.max(0, guestHearts - 1);
+      } else if (guestDist < hostDist) {
+        roundWinner = 'guest';
+        hostHearts = Math.max(0, hostHearts - 1);
+      } else {
+        roundWinner = 'tie';
+      }
+
+      let nextStatus = 'reveal';
+      let winnerRole = null;
+
+      if (hostHearts <= 0 && guestHearts <= 0) {
+        nextStatus = 'finished';
+        winnerRole = 'tie';
+      } else if (hostHearts <= 0) {
+        nextStatus = 'finished';
+        winnerRole = 'guest';
+      } else if (guestHearts <= 0) {
+        nextStatus = 'finished';
+        winnerRole = 'host';
+      }
+
+      state.mp.roomData = {
+        ...data,
+        status: nextStatus,
+        hostHearts,
+        guestHearts,
+        winnerRole,
+        lastRoundResult: {
+          hostDist,
+          guestDist,
+          roundWinner
+        }
+      };
+      broadcastRoomState();
+      handleRoomUpdate(state.mp.roomData);
+    }
+
+    function hostNextMultiplayerRound() {
+      const data = state.mp.roomData;
+      if (state.mp.role !== 'host' || !data) return;
+
+      state.mp.roomData = {
+        ...data,
+        status: 'playing',
+        roundIndex: data.roundIndex + 1,
+        roundEndTime: Date.now() + ROUND_DURATION_SEC * 1000,
+        hostGuess: null,
+        guestGuess: null,
+        lastRoundResult: null
+      };
+      broadcastRoomState();
+      handleRoomUpdate(state.mp.roomData);
+    }
+
+    // =========================================================================
+    // 11. NAVIGATION & EVENT BINDINGS
+    // =========================================================================
+    function returnToLobby() {
+      stopTimer();
+      clearMapOverlays();
+      resetMapView();
+      cleanupPeer();
+
+      state.mode = 'lobby';
+      state.phase = 'idle';
+      state.mp.roomCode = null;
+      state.mp.role = null;
+      state.mp.roomData = null;
+      state.mp.lastPhaseKey = null;
+
+      el.hudOverlay.classList.add('hidden');
+      el.bottomBar.classList.add('hidden');
+      el.waitingOverlay.classList.add('hidden');
+      el.summaryOverlay.classList.add('hidden');
+      el.lobbyOverlay.classList.remove('hidden');
+    }
+<!-- ... existing code ... -->
+    // Initialize multiplayer & map sizing on load
+    window.addEventListener('load', () => {
+      map.invalidateSize();
+      initMultiplayer();
+    });
+  </script>
+</body>
+</html>
